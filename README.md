@@ -1,2 +1,4 @@
-# DeViT
-PyTorch implementation of the paper: Decomposing Vision Transformers for Collaborative Inference in Edge Devices
+
+# DeViT: Decomposing Vision Transformers for Collaborative Inference in Edge Devices
+PyTorch implementation of the paper: DeViT: Decomposing Vision Transformers for Collaborative Inference in Edge Devices
+
