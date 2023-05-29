@@ -1,3 +1,8 @@
+'''
+Refer from https://github.com/SHI-Labs/Compact-Transformers/blob/main/src/cct.py
+'''
+
+
 import torch
 from torch.hub import load_state_dict_from_url
 import torch.nn as nn

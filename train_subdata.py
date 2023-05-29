@@ -43,7 +43,7 @@ def get_args_parser():
     parser.add_argument('--model', default='deit_base_distilled_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--model-path', type=str,
-                        default=r'F:\program_lab\python\py3\decomposition_cv\checkpoint\deit\pretrain_im1k\deit_base_distilled_patch16_224.pth')
+                        default=r'./model_path')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
@@ -139,15 +139,14 @@ def get_args_parser():
     parser.add_argument('--teacher-model', default='deit_base_distilled_patch16_224', type=str, metavar='MODEL',
                         help='Name of teacher model to train')
     parser.add_argument('--teacher-path', type=str,
-                        default=r'F:\program_lab\python\py3\decomposition_cv\checkpoint\vit\vit_large_train_sub\vit_large_train_sub')
+                        default=r'./teacher_path')
     parser.add_argument('--distillation-type', default='none', choices=['none', 'soft', 'hard'], type=str, help="")
-    # parser.add_argument('--distillation-token', type=bool, default=True, help="Whether to distill token")
     parser.add_argument('--distillation-token', action='store_true', help="Whether to distill token")
     parser.add_argument('--distillation-alpha', default=0.5, type=float, help="")
     parser.add_argument('--distillation-tau', default=1.0, type=float, help="")
 
     # Dataset parameters
-    parser.add_argument('--data-path', default=r'F:\program_lab\python\py3\decomposition_cv\dataset\flower_division4',
+    parser.add_argument('--data-path', default=r'./datsets',
                         type=str,
                         help='dataset path')
     parser.add_argument('--dataset', default='cifar100', choices=['cifar100', 'IMNET', 'cars', 'pets', 'flowers'],
@@ -164,7 +163,7 @@ def get_args_parser():
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
                         type=str, help='semantic granularity')
 
-    parser.add_argument('--output_dir', default='/output',
+    parser.add_argument('--output_dir', default='./output',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -173,7 +172,6 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    # parser.add_argument('--eval', type=bool, default=True, help='Perform evaluation only')
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument("--local_rank", type=int, default=-1,
@@ -189,7 +187,6 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
-    # args = parser.parse_args()
     return parser
 
 
@@ -509,7 +506,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('ViT training and evaluation script on sub-dataset', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('DeViT training and evaluation script on sub-dataset', parents=[get_args_parser()])
     args = parser.parse_args()
     args.name = f'lr{args.lr}-bs{args.batch_size}-epochs{args.epochs}-grad{args.clip_grad}' \
                 f'-wd{args.weight_decay}-wm{args.warmup_epochs}'

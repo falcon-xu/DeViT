@@ -7,9 +7,6 @@ import argparse
 import time
 import datetime
 import json
-import math
-import sys
-from typing import Iterable, Optional
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -22,19 +19,19 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
 from timm.models import create_model
 from timm.optim import create_optimizer
-from timm.utils import ModelEma, accuracy, NativeScaler
+from timm.utils import ModelEma
 
 import models.de_vit
 from models.de_vit import model_config
 from data.get_dataset import build_dataset
 from utils.samplers import RASampler
-from models.ensemble_models import MultiModels
-from engine import train_1epoch_ensemble, evaluate
+from models.ensemble_models import MultiModels, MultiViT, EnsMLP
+from engine import train_1epoch_ens_disjoint, evaluate_ens_disjoint
 
 from utils import dist_utils
 from utils.dist_utils import get_rank, get_world_size, init_distributed_mode
 from utils.logger import create_logger
-from utils.losses import EnsembleLoss, EnsLoss
+from utils.losses import EnsLoss
 
 
 def get_args_parser():
@@ -44,10 +41,10 @@ def get_args_parser():
     parser.add_argument('--epochs', default=3, type=int)
 
     # Model parameters
-    parser.add_argument('--model', default='vit_tiny_patch16_224', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='dedeit', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--model-path', type=str,
-                        default=r'F:\program_lab\python\py3\decomposition_cv\output\finished\cifar100_nodiv_seed\distill_hard')
+                        default=r'./ckpt')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
@@ -144,14 +141,14 @@ def get_args_parser():
     parser.add_argument('--teacher-model', default='vit_large_patch16_224', type=str, metavar='MODEL',
                         help='Name of teacher model to train (default: "regnety_160"')
     parser.add_argument('--teacher-path', type=str,
-                        default=r'F:\program_lab\python\py3\decomposition_cv\checkpoint\vit\vit_large_trian_whole_cifar100\v1\checkpoint.pth')
+                        default=r'./teacher_path')
     parser.add_argument('--distillation-type', default='hard', choices=['none', 'soft', 'hard'], type=str, help="")
     parser.add_argument('--distillation-alpha', default=0.5, type=float, help="")
     parser.add_argument('--distillation-tau', default=1.0, type=float, help="")
-    parser.add_argument('--loss', default='mse', choices=['mse', 'kldiv'], type=str, help="")
+    parser.add_argument('--loss', default='mse', choices=['mse', 'kldiv'], type=str, help="loss type")
 
     # Dataset parameters
-    parser.add_argument('--data-path', default=r'F:\program_lab\python\dataset',
+    parser.add_argument('--data-path', default=r'./datasets',
                         type=str,
                         help='dataset path')
     parser.add_argument('--dataset', default='cifar100', choices=['cifar100', 'IMNET', 'INAT', 'INAT19'],
@@ -160,12 +157,12 @@ def get_args_parser():
                         type=int,
                         default=4,
                         help='The number of sub models')
-    parser.add_argument('--sub_classes', nargs='+', default=[100, 100, 100, 100], help="")
+    parser.add_argument('--sub_classes', nargs='+', default=[25, 25, 25, 25], help="")
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
                         type=str, help='semantic granularity')
 
-    parser.add_argument('--output_dir', default='/output',
+    parser.add_argument('--output_dir', default='./output',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -174,7 +171,6 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    # parser.add_argument('--eval', type=bool, default=True, help='Perform evaluation only')
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--pin-mem', action='store_true',
@@ -195,13 +191,7 @@ def get_args_parser():
 
 def dict_map(dict1, start1, dict2, start2, length):
     '''
-    将dict2字典对应位置的值拷贝到dict1字典
-    @param dict1:
-    @param start1: dict1 初始位置
-    @param dict2:
-    @param start2: dict2 初始位置
-    @param length: 拷贝的长度
-    @return:
+    copy dict
     '''
     dict1_list = list(dict1.keys())
     dict2_list = list(dict2.keys())
@@ -215,34 +205,41 @@ def get_models(args, num_subs, sub_classes, num_classes=100):
     teacher_model = None
     teacher_model_config = model_config[args.teacher_model]
     if args.distillation_type != 'none':
-        teacher_ckpt = torch.load(args.teacher_path, map_location='cpu')
+        teacher_path = None if args.dataset != 'IMNET' else args.teacher_path
         teacher_model = create_model(args.teacher_model,
+                                     pretrained=teacher_path,
                                      num_classes=num_classes,
                                      drop_rate=args.drop,
                                      drop_path_rate=args.drop_path,
                                      drop_block_rate=None, )
+
         if args.dataset != 'IMNET':
-            teacher_model.load_state_dict(teacher_ckpt)
-        else:
-            teacher_model.load_state_dict(teacher_ckpt['model'])
+            teacher_model.load_state_dict(torch.load(args.teacher_path, map_location='cpu'))
+
         teacher_model.to(args.device)
         teacher_model.eval()
 
-    model = MultiModels(model=args.model, drop=args.drop, drop_path=args.drop_path, num_div=num_subs,
-                        num_classes_list=sub_classes, teacher_size=teacher_model_config['embed_dim'],
-                        sub_size=model_config[args.model]['embed_dim'])
+    model = MultiViT(model=args.model, drop=args.drop, drop_path=args.drop_path, num_div=num_subs,
+                        num_classes_list=sub_classes)
+    ens_model = EnsMLP(model=args.model, num_class=args.num_classes, sub_size=model_config[args.model]['embed_dim'],
+                       num_classes_list=sub_classes, teacher_size=teacher_model_config['embed_dim'])
+
     # Load paras
     multi_models_dict = model.state_dict()
-    subpath_list = os.listdir(args.model_path)
-    for i, subpath in enumerate(subpath_list):
-        model_path = os.path.join(args.model_path, subpath, 'checkpoint.pth')
+    for i in range(num_subs):
+        model_path = os.path.join(args.model_path, f'sub-dataset{i}', 'checkpoint.pth')
         load_model_dict = torch.load(model_path, map_location='cpu')
-        multi_models_dict = dict_map(multi_models_dict, i * (len(load_model_dict) - 2), load_model_dict, 0,
-                                     len(load_model_dict) - 2)
+        if 'vit' in args.model:
+            multi_models_dict = dict_map(multi_models_dict, i * (len(load_model_dict) - 2), load_model_dict, 0,
+                                         len(load_model_dict) - 2)
+        else:
+            multi_models_dict = dict_map(multi_models_dict, i * (len(load_model_dict) - 4), load_model_dict, 0,
+                                         len(load_model_dict) - 4)
     model.load_state_dict(multi_models_dict)
     model.to(args.device)
+    ens_model.to(args.device)
 
-    return teacher_model, model
+    return teacher_model, model, ens_model
 
 
 def main(args):
@@ -312,10 +309,11 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.num_classes)
 
     logger.info(f"Creating the ensemble of models: {args.model}")
-    teacher_model, model = get_models(args=args, num_subs=args.num_division, num_classes=args.num_classes,
+    teacher_model, model, ens_model = get_models(args=args, num_subs=args.num_division, num_classes=args.num_classes,
                                       sub_classes=args.sub_classes)
 
     model_ema = None
+    ens_model_ema = None
     if args.model_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
         model_ema = ModelEma(
@@ -323,20 +321,31 @@ def main(args):
             decay=args.model_ema_decay,
             device='cpu' if args.model_ema_force_cpu else '',
             resume='')
+        ens_model_ema = ModelEma(
+            ens_model,
+            decay=args.model_ema_decay,
+            device='cpu' if args.model_ema_force_cpu else '',
+            resume='')
 
     model_without_ddp = model
+    ens_model_without_ddp = ens_model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        ens_model = torch.nn.parallel.DistributedDataParallel(ens_model, device_ids=[args.gpu])
         model_without_ddp = model.module
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        ens_model_without_ddp = ens_model.module
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad) + \
+                   sum(p.numel() for p in ens_model.parameters() if p.requires_grad)
     logger.info(f'number of params: {n_parameters}')
 
     linear_scaled_lr = args.lr * args.batch_size * get_world_size() / 512.0
     args.lr = linear_scaled_lr
     optimizer = create_optimizer(args, model_without_ddp)
-    loss_scaler = NativeScaler()
+    ens_optimizer = create_optimizer(args, ens_model_without_ddp)
+    loss_scaler = torch.cuda.amp.GradScaler()
 
     lr_scheduler, _ = create_scheduler(args, optimizer)
+    ens_lr_scheduler, _ = create_scheduler(args, ens_optimizer)
 
     criterion = LabelSmoothingCrossEntropy()
     if mixup_active:
@@ -352,7 +361,7 @@ def main(args):
                                 tau=args.distillation_tau, model=args.model, loss_type=args.loss)
 
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, args.device)
+        test_stats = evaluate_ens_disjoint(data_loader_val, model, ens_model, args.device)
         logger.info(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%")
         return
 
@@ -369,30 +378,38 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_1epoch_ensemble(model=model, criterion=distill_criterion, data_loader=data_loader_train,
-                                            optimizer=optimizer, device=args.device, epoch=epoch, log=logger,
-                                            loss_scaler=loss_scaler, args=args, max_norm=args.clip_grad,
-                                            model_ema=model_ema, mixup_fn=mixup_fn)
+        train_stats = train_1epoch_ens_disjoint(model=model, ens_model=ens_model, criterion=distill_criterion,
+                                                data_loader=data_loader_train, optimizer=optimizer,
+                                                ens_optimizer=ens_optimizer, device=args.device, epoch=epoch,
+                                                scaler=loss_scaler, args=args, log=logger, model_ema=model_ema,
+                                                ens_model_ema=ens_model_ema, mixup_fn=mixup_fn, max_norm=args.clip_grad)
 
         lr_scheduler.step(epoch)
+        ens_lr_scheduler.step(epoch)
+
         if output_dir and dist_utils.is_main_process():
             checkpoint_path = os.path.join(output_dir, 'checkpoint_temp.pth')
             dist_utils.save_on_master({
                 'model': model_without_ddp.state_dict(),
+                'ens_model': ens_model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'ens_optimizer': ens_optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
+                'ens_lr_scheduler': ens_lr_scheduler.state_dict(),
                 'epoch': epoch,
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
             }, checkpoint_path)
         if writer is not None:
             writer.add_scalar('Train/loss', train_stats['loss'], epoch)
-            writer.add_scalar('Train/lr', train_stats['lr'], epoch)
+            writer.add_scalar('Train/backbone_lr', train_stats['backbone_lr'], epoch)
+            writer.add_scalar('Train/ens_lr', train_stats['ens_lr'], epoch)
             if args.distillation_type != 'none':
                 writer.add_scalar('Train/token_loss', train_stats['token_loss'], epoch)
         logger.info(f"Epoch: {epoch}/{args.epochs} \t [Train] Loss: {train_stats['loss']:.4f} \t ")
 
-        test_stats = evaluate(data_loader=data_loader_val, model=model, device=args.device)
+        test_stats = evaluate_ens_disjoint(data_loader=data_loader_val, model=model, ens_model=ens_model,
+                                           device=args.device)
         if writer is not None:
             writer.add_scalar('Test/loss', test_stats['loss'], epoch)
             writer.add_scalar('Test/Top1', test_stats['acc1'], epoch)
@@ -403,8 +420,8 @@ def main(args):
         if max_accuracy < test_stats["acc1"]:
             max_accuracy = test_stats["acc1"]
             if args.output_dir and dist_utils.is_main_process():
-                model_checkpoint = os.path.join(output_dir, f"checkpoint.pth")
-                torch.save(model_without_ddp.state_dict(), model_checkpoint)
+                torch.save(model_without_ddp.state_dict(), os.path.join(output_dir, f"checkpoint.pth"))
+                torch.save(ens_model_without_ddp.state_dict(), os.path.join(output_dir, f"ens_checkpoint.pth"))
                 torch.save(args, os.path.join(output_dir, 'training_args.bin'))
                 with open(os.path.join(output_dir, 'result.txt'), 'w') as f:
                     f.write(f'Final Accuracy: {max_accuracy}')
@@ -427,13 +444,13 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('ViT training and evaluation script on sub-dataset', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('DeViT Ensemble script', parents=[get_args_parser()])
     args = parser.parse_args()
     args.name = f'lr{args.lr}-bs{args.batch_size}-epochs{args.epochs}-grad{args.clip_grad}' \
                 f'-wd{args.weight_decay}-wm{args.warmup_epochs}'
     method = {'none': 'sub_no_distill', 'soft': 'distill_sub_soft', 'hard': 'distill_sub_hard'}
-    args.method = f'ensemble_seed{method[args.distillation_type]}'
-    args.output_dir = os.path.join(args.output_dir, f'{args.dataset}_division{args.num_division}', f'{args.model}',
+    args.method = f'ens_disjoint_{method[args.distillation_type]}_{args.loss}'
+    args.output_dir = os.path.join(args.output_dir, f'{args.dataset}_div{args.num_division}', f'{args.model}',
                                    args.method, args.name)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)

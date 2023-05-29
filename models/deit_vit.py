@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 # @Time    : 2022/4/21 15:26
 # @Author  : Falcon
-# @FileName: modeling_timm_qkv.py
-
-# output in a list type
+# @FileName: deit_vit.py
 
 import math
 from collections import OrderedDict

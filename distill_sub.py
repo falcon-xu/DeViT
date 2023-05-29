@@ -1,67 +1,51 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2022/5/30 10:56
+# @Time    : 2023/3/14 15:43
 # @Author  : Falcon
-# @FileName: train_whole_data.py.py
+# @FileName: distill_sub.py
 import os
+import json
 import argparse
-import sys
 import datetime
-import numpy as np
-import math
-from typing import Iterable, Optional
 import time
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-import json
-
 from pathlib import Path
 
 from timm.data import Mixup
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from timm.models import create_model
 from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
-from timm.utils import NativeScaler, accuracy
+from timm.utils import NativeScaler, ModelEma, get_state_dict
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
-from data.get_dataset import build_dataset
-from utils.samplers import RASampler
-from models.modeling_timm import get_vit_base_patch16_224, get_vit_large_patch16_224, get_vit_tiny_patch16_224
-from models.t2t_vit import get_t2t_vit_14, get_t2t_vit_t_14, get_t2t_vit_7
+from engine import evaluate, train_1epoch_qkv
+from data.get_dataset import build_division_dataset
+
+import models.de_vit
+from models.de_vit import model_config
 
 from utils import dist_utils
-from utils.dist_utils import get_rank, get_world_size, init_distributed_mode
+from utils.samplers import RASampler
 from utils.logger import create_logger
+from utils.losses import DistillLoss
+from utils.dist_utils import get_rank, get_world_size
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('ViT training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=2, type=int)
-    parser.add_argument('--eval-batch-size', default=2, type=int)
+    parser.add_argument('--eval-batch-size', default=512, type=int)
     parser.add_argument('--epochs', default=5, type=int)
+    parser.add_argument('--output_dir', default=r'./output',
+                        help='path where to save, empty for no saving')
+    parser.add_argument('--finetune', action='store_true', help="Whether to finetune")
 
     # Model parameters
-    # parser.add_argument('--model', default='cct7_7x2', type=str, metavar='MODEL',
-    #                     help='Name of model to train')
-    # parser.add_argument('--model', default='twins_pcpvt_small', type=str, metavar='MODEL',
-    #                     help='Name of model to train')
-    # parser.add_argument('--model-path', type=str,
-    #                     default=r'')
-    # parser.add_argument('--model', default='twins_svt_small', type=str, metavar='MODEL',
-    #                     help='Name of model to train')
-    # parser.add_argument('--model-path', type=str,
-    #                     default=r'F:\program_lab\python\py3\decomposition_cv\checkpoint\twins\twins_svt_small-42e5f78c.pth')
-    # parser.add_argument('--model', default='t2t_vit_t_14', type=str, metavar='MODEL',
-    #                     help='Name of model to train')
-    # parser.add_argument('--model-path', type=str,
-    #                     default=r'F:\program_lab\python\py3\decomposition_cv\checkpoint\t2t\81.7_T2T_ViTt_14.pth.tar')
-    # parser.add_argument('--model', default='vit_large', type=str, metavar='MODEL',
-    #                     help='Name of model to train')
-    # parser.add_argument('--model-path', type=str,
-    #                     default=r'F:\program_lab\python\py3\decomposition_cv\checkpoint\vit\pretrain_im1k\L_16-i1k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.1-sd_0.1.npz')
-    parser.add_argument('--model', default='vit_base', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='dedeit', type=str, metavar='MODEL',
                         help='Name of model to train')
-    parser.add_argument('--model-path', type=str,
-                        default=r'F:\program_lab\python\py3\decomposition_cv\checkpoint\vit\others\B_16-i1k-300ep-lr_0.001-aug_medium2-wd_0.1-do_0.0-sd_0.0.npz')
+    parser.add_argument('--model-path', type=str, default='')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',
@@ -124,11 +108,10 @@ def get_args_parser():
     parser.add_argument('--smoothing', type=float, default=0.1, help='Label smoothing (default: 0.1)')
     parser.add_argument('--train-interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
-
     parser.add_argument('--repeated-aug', action='store_true')
     parser.add_argument('--no-repeated-aug', action='store_false', dest='repeated_aug')
     parser.set_defaults(repeated_aug=True)
-    parser.add_argument('--no-aug', action='store_true', help='not use aug')
+    parser.add_argument('--no_aug', action='store_true', help="no aug")
 
     # * Random Erase params
     parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
@@ -154,23 +137,42 @@ def get_args_parser():
     parser.add_argument('--mixup-mode', type=str, default='batch',
                         help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 
+    # Distillation parameters
+    parser.add_argument('--teacher-model', default='vit_large_patch16_224', type=str, metavar='MODEL',
+                        help='Name of teacher model to train')
+    parser.add_argument('--teacher-path', type=str,
+                        default=r'./teacher_ckpt')
+    parser.add_argument('--distillation-type', default='hard', choices=['none', 'soft', 'hard'], type=str, help="")
+    parser.add_argument('--distillation-inter', type=bool, default=True,
+                        help="Whether to distill intermediate features")
+    # parser.add_argument('--distillation-token', type=bool, default=True, help="Whether to distill token")
+    parser.add_argument('--distillation-token', action='store_true', help="Whether to distill token")
+    parser.add_argument('--distillation-alpha', default=0.5, type=float, help="")
+    parser.add_argument('--distillation-tau', default=1.0, type=float, help="")
+    # Loss parameters
+    parser.add_argument('--gama', nargs='+', default=[0.2, 0.1, 0.3], help="paras to adjust loss")
+
     # Dataset parameters
-    parser.add_argument('--data-path', default=r'F:\program_lab\python\dataset',
+    parser.add_argument('--data-path', default=r'./datasets',
                         type=str,
                         help='dataset path')
-    parser.add_argument('--data-set', default='cifar100',
-                        choices=['cifar100', 'flowers', 'cars', 'pets', 'IMNET', 'INAT', 'INAT19'],
+    parser.add_argument('--dataset', default='cifar100', choices=['cifar100', 'IMNET', 'cars', 'pets', 'flowers'],
                         type=str, help='Image Net dataset path')
-    parser.add_argument('--num_division', metavar='N',
-                        type=int,
-                        default=4,
-                        help='The number of sub models')
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
                         type=str, help='semantic granularity')
 
-    parser.add_argument('--output_dir', default=r'F:\program_lab\python\py3\decomposition_cv\output',
-                        help='path where to save, empty for no saving')
+    # Division parameters
+    parser.add_argument('--num_division', metavar='N',
+                        type=int,
+                        default=4,
+                        help='The number of sub models')
+    parser.add_argument('--start-division', metavar='N',
+                        type=int,
+                        default=0,
+                        help='The number of sub models')
+
+    # Others
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
@@ -178,7 +180,6 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
-    # parser.add_argument('--eval', type=bool, default=True, help='Perform evaluation only')
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument("--local_rank", type=int, default=-1,
@@ -188,8 +189,6 @@ def get_args_parser():
     parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
                         help='')
     parser.set_defaults(pin_mem=True)
-    parser.add_argument('--disable_amp', action='store_true', default=False,
-                        help='disable AMP')
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -200,108 +199,74 @@ def get_args_parser():
     return parser
 
 
-def train_one_epoch(model: torch.nn.Module, criterion,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, log, max_norm: float = 0,
-                    mixup_fn: Optional[Mixup] = None):
-    model.train(mode=True)
-    metric_logger = dist_utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', dist_utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
+def get_models(args, num_classes, num_sub, log):
+    stu_nb = 1000 if args.model_path != '' else num_classes
+    model_path = args.model_path if args.finetune else None
+    resize_dim = model_config[args.teacher_model]["embed_dim"] if args.distillation_token else None
+    model = create_model(
+        args.model,
+        pretrained=True,
+        pretrained_path=model_path,
+        num_classes=stu_nb,
+        resize_dim=resize_dim,
+        drop_rate=args.drop,
+        drop_path_rate=args.drop_path,
+        drop_block_rate=None,
+    )
+    log.info(f'Create {args.model} model\n Load ckpt from [PATH]: {model_path}')
+    if args.model_path != '':
+        model.reset_classifier(num_classes=num_classes)
+    model.to(args.device)
 
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-        samples = samples.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+    teacher_model = None
+    if args.distillation_type != 'none':
+        teacher_path = os.path.join(args.teacher_path, f'sub-dataset{num_sub}', 'checkpoint.pth')
+        teacher_ckpt = torch.load(teacher_path, map_location='cpu')
+        teacher_model = create_model(args.teacher_model,
+                                     num_classes=num_classes,
+                                     drop_rate=args.drop,
+                                     drop_path_rate=args.drop_path,
+                                     drop_block_rate=None, )
+        teacher_model.load_state_dict(teacher_ckpt)
+        teacher_model.to(args.device)
+        teacher_model.eval()
 
-        if mixup_fn is not None:
-            samples, targets = mixup_fn(samples, targets)
-
-        if args.disable_amp:
-            outputs = model(samples)
-            loss = criterion(outputs, targets)
-        else:
-            with torch.cuda.amp.autocast():
-                outputs = model(samples)
-                loss = criterion(outputs, targets)
-
-        loss_value = loss.item()
-
-        if not math.isfinite(loss_value):
-            log.info("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
-
-        optimizer.zero_grad()
-
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order)
-
-        torch.cuda.synchronize()
-        # if model_ema is not None:
-        #     model_ema.update(model)
-
-        metric_logger.update(loss=loss_value)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    log.info(f"Averaged stats: {metric_logger}")
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
-@torch.no_grad()
-def evaluate(data_loader, model, device):
-    criterion = torch.nn.CrossEntropyLoss()
-
-    metric_logger = dist_utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
-
-    # switch to evaluation mode
-    model.eval()
-
-    for images, target in metric_logger.log_every(data_loader, 10, header):
-        images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
-
-        # compute output
-        with torch.cuda.amp.autocast():
-            output = model(images)
-            loss = criterion(output, target)
-
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-        batch_size = images.shape[0]
-        metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    # log.info('Top-1: {top1.global_avg:.3f} \t Top5: {top5.global_avg:.3f} \t loss: {losses.global_avg:.3f}'
-    #          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
-
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return model, teacher_model
 
 
 def main(args):
-    init_distributed_mode(args)
+    dist_utils.init_distributed_mode(args)
+
+    # Create output path
+    if args.model_path != '':
+        args.method = f'distill_sub_qkv_{args.distillation_type}_load'
+    else:
+        args.method = f'distill_sub_qkv_{args.distillation_type}_noload'
+    args.name = f'lr{args.lr}-bs{args.batch_size}-epochs{args.epochs}-grad{args.clip_grad}' \
+                f'-wd{args.weight_decay}-wm{args.warmup_epochs}-gama{args.gama[0]}_{args.gama[1]}_{args.gama[2]}'
+    args.output_dir = os.path.join(args.output_dir, f'{args.dataset}_div{args.num_division}', f'{args.model}',
+                                   args.method, args.name)
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     # log init
-    logger = create_logger(output_dir=args.output_dir, dist_rank=get_rank(), name=f"{args.method}")
-
+    logger = create_logger(output_dir=args.output_dir, dist_rank=dist_utils.get_rank(), name=f"{args.method}")
     logger.info(args)
 
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + get_rank()
+    seed = args.seed + dist_utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     cudnn.benchmark = True
 
-    train_dataset, test_dataset, num_classes = build_dataset(args)
-    args.num_classes = num_classes
+    # Load dataset
+    sub_dataset_path = os.path.join(args.data_path, f'sub-dataset{args.start_division}')
+
+    train_dataset, test_dataset, division_num_classes = build_division_dataset(dataset_path=sub_dataset_path, args=args)
+    args.num_classes = division_num_classes
 
     num_tasks = get_world_size()
     global_rank = get_rank()
@@ -335,7 +300,6 @@ def main(args):
 
     data_loader_val = torch.utils.data.DataLoader(
         test_dataset, sampler=sampler_val,
-        # batch_size=int(1.5 * args.batch_size),
         batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
@@ -348,57 +312,18 @@ def main(args):
         mixup_fn = Mixup(
             mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.num_classes)
+            label_smoothing=args.smoothing, num_classes=division_num_classes)
 
-    logger.info(f"Creating model: {args.model}")
-    model = None
-    if args.model == 'vit_large':
-        model = get_vit_large_patch16_224(pretrained_path=args.model_path, num_classes=num_classes)
-    elif args.model == 'vit_tiny':
-        model = get_vit_tiny_patch16_224(pretrained_path=args.model_path, num_classes=num_classes)
-    elif args.model == 'vit_base':
-        model = get_vit_base_patch16_224(pretrained_path=args.model_path, num_classes=num_classes)
-    elif args.model == 't2t_vit_t_14':
-        model = get_t2t_vit_t_14(pretrained_path=args.model_path, num_classes=num_classes)
-    elif args.model == 't2t_vit_14':
-        model = get_t2t_vit_14(pretrained_path=args.model_path, num_classes=num_classes)
-    elif args.model == 'twins_pcpvt_small':
-        from models.twins import get_twins_pcpvt_small
-        model = get_twins_pcpvt_small(pretrained_path=args.model_path, num_classes=num_classes)
-    elif args.model == 'twins_svt_small':
-        from models.twins import get_twins_svt_small
-        model = get_twins_svt_small(pretrained_path=args.model_path, num_classes=num_classes)
-    else:
-        if args.model.split('_')[0] == 'cct2':
-            from models.cct import get_cct2
-            cfg = args.model.split('_')[-1]
-            kernel_size, conv_layers = [int(i) for i in cfg.split('x')]
-            model = get_cct2(img_size=args.input_size, kernel_size=kernel_size,
-                             n_conv_layers=conv_layers)
-        elif args.model.split('_')[0] == 'cct6':
-            from models.cct import get_cct6
-            cfg = args.model.split('_')[-1]
-            kernel_size, conv_layers = [int(i) for i in cfg.split('x')]
-            model = get_cct6(img_size=args.input_size, kernel_size=kernel_size,
-                             n_conv_layers=conv_layers)
-        elif args.model.split('_')[0] == 'cct7':
-            from models.cct import get_cct7
-            cfg = args.model.split('_')[-1]
-            kernel_size, conv_layers = [int(i) for i in cfg.split('x')]
-            model = get_cct7(img_size=args.input_size, kernel_size=kernel_size,
-                             n_conv_layers=conv_layers)
-        elif args.model.split('_')[0] == 'cct14':
-            from models.cct import get_cct14
-            cfg = args.model.split('_')[-1]
-            kernel_size, conv_layers = [int(i) for i in cfg.split('x')]
-            model = get_cct14(img_size=args.input_size, kernel_size=kernel_size,
-                              n_conv_layers=conv_layers)
+    model, teacher_model = get_models(args, division_num_classes, args.start_division, logger)
 
-        if args.model_path != '':
-            load_dict = torch.load(args.model_path)
-            model.load_state_dict(load_dict)
-            model.reset_classifier(num_classes=num_classes)
-    model.to(device)
+    model_ema = None
+    if args.model_ema:
+        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
+        model_ema = ModelEma(
+            model,
+            decay=args.model_ema_decay,
+            device='cpu' if args.model_ema_force_cpu else '',
+            resume='')
 
     model_without_ddp = model
     if args.distributed:
@@ -407,6 +332,8 @@ def main(args):
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f'number of params: {n_parameters}')
 
+    linear_scaled_lr = args.lr * args.batch_size * get_world_size() / 512.0
+    args.lr = linear_scaled_lr
     optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
 
@@ -421,13 +348,38 @@ def main(args):
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
+    ##TODO: choose criterion
+    # wrap the criterion in our custom DistillationLoss, which
+    # just dispatches to the original criterion if args.distillation_type is 'none'
+    criterion = DistillLoss(base_criterion=criterion, distillation_type=args.distillation_type,
+                            alpha=args.distillation_alpha, tau=args.distillation_tau)
+
+    if args.resume:
+        logger.info(f'Load resume checkpoint from [PATH]: {args.resume}')
+        if args.resume.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.resume, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.resume, map_location='cpu')
+
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        if not args.eval and not args.prune_finetune and \
+                'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            args.start_epoch = checkpoint['epoch'] + 1
+            if args.model_ema:
+                dist_utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
+            if 'scaler' in checkpoint:
+                loss_scaler.load_state_dict(checkpoint['scaler'])
+
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, args.device)
         logger.info(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%")
         return
 
-    logger.info(f"Start training")
-    output_dir = Path(args.output_dir)
+    logger.info(f"Start training for {args.epochs} epochs in sub-dataset{args.start_division}")
+    output_dir = Path(os.path.join(args.output_dir, f'sub-dataset{args.start_division}'))
     os.makedirs(output_dir, exist_ok=True)
 
     # init tensorboard
@@ -435,39 +387,39 @@ def main(args):
 
     start_time = time.time()
     max_accuracy = 0.0
-    for epoch in range(args.epochs):
+    for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_one_epoch(model=model, criterion=criterion, data_loader=data_loader_train,
-                                      optimizer=optimizer,
-                                      device=device, epoch=epoch, loss_scaler=loss_scaler, log=logger,
-                                      max_norm=args.clip_grad,
-                                      mixup_fn=mixup_fn)
+        train_stats = train_1epoch_qkv(model=model, teacher_model=teacher_model, criterion=criterion, args=args,
+                                       data_loader=data_loader_train, optimizer=optimizer, device=args.device,
+                                       epoch=epoch, loss_scaler=loss_scaler, log=logger, max_norm=args.clip_grad,
+                                       model_ema=model_ema, mixup_fn=mixup_fn)
 
         lr_scheduler.step(epoch)
-        if output_dir and dist_utils.is_main_process():
-            checkpoint_path = os.path.join(output_dir, 'checkpoint_temp.pth')
-            dist_utils.save_on_master({
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'epoch': epoch,
-                'scaler': loss_scaler.state_dict(),
-                'args': args,
-            }, checkpoint_path)
+        if args.output_dir:
+            checkpoint_paths = [output_dir / 'checkpoint_temp.pth']
+            for checkpoint_path in checkpoint_paths:
+                dist_utils.save_on_master({
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'model_ema': get_state_dict(model_ema),
+                    'scaler': loss_scaler.state_dict(),
+                    'args': args,
+                }, checkpoint_path)
+
+        test_stats = evaluate(data_loader=data_loader_val, model=model, device=args.device)
+        logger.info(f"Epoch: {epoch}/{args.epochs} \t [Train] Loss: {train_stats['loss']:.4f} \t ")
+        logger.info(f"Epoch: {epoch}/{args.epochs} \t [Eval] Top-1: {test_stats['acc1']:.4f} \t "
+                    f"Top-5: {test_stats['acc5']:.4f} \t Loss: {test_stats['loss']:.4f} \t ")
         if writer is not None:
             writer.add_scalar('Train/loss', train_stats['loss'], epoch)
             writer.add_scalar('Train/lr', train_stats['lr'], epoch)
-        logger.info(f"Epoch: {epoch}/{args.epochs} \t [Train] Loss: {train_stats['loss']:.4f} \t ")
-
-        test_stats = evaluate(data_loader=data_loader_val, model=model, device=device)
-        if writer is not None:
             writer.add_scalar('Test/loss', test_stats['loss'], epoch)
             writer.add_scalar('Test/Top1', test_stats['acc1'], epoch)
             writer.add_scalar('Test/Top5', test_stats['acc5'], epoch)
-        logger.info(f"Epoch: {epoch}/{args.epochs} \t [Eval] Top-1: {test_stats['acc1']:.4f} \t "
-                    f"Top-5: {test_stats['acc5']:.4f} \t Loss: {test_stats['loss']:.4f} \t ")
 
         if max_accuracy < test_stats["acc1"]:
             max_accuracy = test_stats["acc1"]
@@ -476,10 +428,10 @@ def main(args):
                 torch.save(model_without_ddp.state_dict(), model_checkpoint)
                 torch.save(args, os.path.join(output_dir, 'training_args.bin'))
                 with open(os.path.join(output_dir, 'result.txt'), 'w') as f:
-                    f.write(f'Final Accuracy: {max_accuracy}')
+                    f.write(f'Final Accuracy: {max_accuracy}\n'
+                            f'Model config: {model_config}')
                 logger.info(f'Saving model in [PATH]: {output_dir}')
-
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        logger.info(f'Max accuracy: {max_accuracy:.4f}%')
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
@@ -496,18 +448,10 @@ def main(args):
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info(f'Training time: {total_time_str}')
+    logger.info(f'Training time {total_time_str} on sub-dataset{args.start_division}')
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('vit training and evaluation script on whole dataset', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('DeViT training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
-    args.name = f'{args.model}-lr{args.lr}-bs{args.batch_size}-epochs{args.epochs}-grad{args.clip_grad}' \
-                f'-wd{args.weight_decay}-no_aug' if args.no_aug else f'{args.model}-lr{args.lr}-bs{args.batch_size}-epochs{args.epochs}-grad{args.clip_grad}' \
-                f'-wd{args.weight_decay}'
-    args.method = f'train_whole_timm'
-    args.output_dir = os.path.join(args.output_dir, 'vit_timm', args.data_set, args.method, args.model, args.name)
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
-
