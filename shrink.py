@@ -18,9 +18,8 @@ from timm.utils import NativeScaler, get_state_dict, ModelEma
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
 import models.de_vit_shrink
-from models.vit_prune_new import VisionTransformer, model_config
 from data.get_dataset import build_division_dataset
-from engine import train_one_epoch, evaluate
+from engine import evaluate
 
 from core.search_imp import search
 from core.imp_rank import *
@@ -28,13 +27,14 @@ from core.compute_metric import compute_flops, compute_parameters, cal_prune_par
 
 from utils import dist_utils
 from utils.logger import create_logger
-from utils.losses import DistillationLoss
+from utils.losses import DistillLoss
 from utils.samplers import RASampler
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeViT training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=2, type=int)
+    parser.add_argument('--eval-batch-size', default=512, type=int)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
@@ -140,12 +140,12 @@ def get_args_parser():
     parser.add_argument('--distillation-type', default='none', choices=['none', 'soft', 'hard'], type=str, help="")
     parser.add_argument('--distillation-alpha', default=0.5, type=float, help="")
     parser.add_argument('--distillation-tau', default=1.0, type=float, help="")
-    
+
     # * Finetuning params
     parser.add_argument('--finetune', default='', help='finetune from checkpoint')
 
     # Dataset parameters
-    parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
+    parser.add_argument('--data-path', default=r'F:\program_lab\python\dataset', type=str,
                         help='dataset path')
     parser.add_argument('--data-set', default='cifar100', choices=['cifar100', 'IMNET', 'cars', 'pets', 'flowers'],
                         type=str, help='Image Net dataset path')
@@ -189,7 +189,6 @@ def get_args_parser():
     parser.add_argument('--neuron_sparsity', type=float, default=0.)
     parser.add_argument('--head_sparsity', type=float, default=0.)
 
-    parser.add_argument('--search', action='store_true', default=False)
     parser.add_argument('--shrink_ratio', type=float, default=0.3, help='shrinking ratio')
     parser.add_argument('--search_bound', type=float, default=0.5, help='upper bound')
     parser.add_argument('--search_population', type=int, default=100)
@@ -202,11 +201,7 @@ def main(args):
 
     # Create output path
     args.method = f'shrink'
-    if args.search and args.eval:
-        args.name = f'search-bs{args.batch_size}-sc_epoch{args.search_epoch}-ratio{args.shrink_ratio}' \
-                    f'-sc_ub{args.search_bound}'
-        args.output_dir = os.path.join(args.output_dir, args.method, args.data_set,
-                                       args.model + f'-C{args.classifier_choose}', args.name)
+    args.output_dir = os.path.join(args.output_dir, args.method)
 
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -232,7 +227,7 @@ def main(args):
 
     num_tasks = dist_utils.get_world_size()
     global_rank = dist_utils.get_rank()
-    
+
     if args.repeated_aug:
         sampler_train = RASampler(
             train_dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True
@@ -276,7 +271,6 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
-
     logger.info(f"Creating model: {args.model}")
     model = create_model(
         args.model,
@@ -286,7 +280,7 @@ def main(args):
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
     )
-    
+
     model_ema = None
     if args.model_ema:
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
@@ -295,7 +289,7 @@ def main(args):
             decay=args.model_ema_decay,
             device='cpu' if args.model_ema_force_cpu else '',
             resume='')
-    
+
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -379,8 +373,8 @@ def main(args):
 
     # wrap the criterion in our custom DistillationLoss, which
     # just dispatches to the original criterion if args.distillation_type is 'none'
-    criterion = DistillationLoss(
-        criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau
+    criterion = DistillLoss(
+        criterion, args.distillation_type, args.distillation_alpha, args.distillation_tau
     )
 
     if args.resume:
@@ -404,18 +398,19 @@ def main(args):
                 if 'scaler' in checkpoint:
                     loss_scaler.load_state_dict(checkpoint['scaler'])
 
-    if args.search:
+    if args.neuron_pruning:
         neuron_rank = mlp_neuron_rank(model_without_ddp, data_loader_train)
         logger.info(f'Finish ranking neuron.')
+    if args.head_pruning:
         head_rank = attn_head_rank(model_without_ddp, data_loader_train)
         logger.info(f'Finish ranking head.')
 
-        xp, yp = search(model=model, data_loader_val=data_loader_val, layer=args.classifier_choose,
-                                       shrink_ratio=args.shrink_ratio, neuron_rank=neuron_rank,
-                                       head_rank=head_rank, device=device, population=args.search_population, lb=0,
-                                       ub=args.search_bound, log=logger)
-        np.save(os.path.join(output_dir, 'searched_policy'), xp)
-        np.save(os.path.join(output_dir, 'searched_accuracy'), yp)
+    xp, yp = search(model=model, data_loader_val=data_loader_val, layer=args.classifier_choose,
+                    shrink_ratio=args.shrink_ratio, neuron_rank=neuron_rank,
+                    head_rank=head_rank, device=device, population=args.search_population, lb=0,
+                    ub=args.search_bound, log=logger)
+    np.save(os.path.join(output_dir, 'shrinked_policy'), xp)
+    np.save(os.path.join(output_dir, 'shrinked_accuracy'), yp)
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)
