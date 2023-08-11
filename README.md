@@ -4,8 +4,6 @@ PyTorch implementation of the paper: DeViT: Decomposing Vision Transformers for 
 
 ## About DeViT
 
-![DEKD](./src/DEKD.png)
-
 We first propose a collaborative inference framework termed **DeViT** to facilitate edge deployment by decomposing large ViTs. Subsequently, we design a decomposition-and-ensemble algorithm based on knowledge distillation, termed DEKD, to fuse multiple small decomposed models while dramatically reducing communication overheads, and handle heterogeneous models by developing a feature matching module to promote the imitations of decomposed models from the large ViT. Extensive experiments for three representative ViT backbones on four widely-used datasets demonstrate our method achieve efficient collaborative inference for ViTs and outperforms existing lightweight ViTs, striking a good trade-off between efficiency and accuracy.
 
 
@@ -18,11 +16,7 @@ pytorch==1.8.1
 torchvision==0.9.1
 tqdm==4.65.0
 timm==0.5.4
-scikit-optimize==0.9.0
-scikit_learn==1.0.2
 ```
-
-
 
 ### Datasets
 
@@ -33,7 +27,17 @@ scikit_learn==1.0.2
 
 ### Usage
 
-
+Frist, clone the repository locally: 
+```
+git clone https://github.com/lostsword/DeViT.git
+```
+Then, install Pytorch, timm, and other dependencies: 
+```
+conda install -c pytorch pytorch torchvision
+pip3 install timm==0.5.4
+pip3 install -r requirements.txt
+```
+Next, follow these steps: 
 
 - Split the dataset into sub-datasets according to the number of devices
 
