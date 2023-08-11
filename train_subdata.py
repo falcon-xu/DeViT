@@ -332,10 +332,8 @@ def main(args):
     np.random.seed(seed)
     cudnn.benchmark = True
 
-    i = args.start_division
-
     # Load dataset
-    sub_dataset_path = os.path.join(args.data_path, f'sub-dataset{i}')
+    sub_dataset_path = os.path.join(args.data_path, f'sub-dataset{args.start_division}')
     train_dataset, test_dataset, division_num_classes = build_division_dataset(dataset_path=sub_dataset_path, args=args)
     args.num_classes = division_num_classes
 
@@ -431,8 +429,8 @@ def main(args):
         logger.info(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%")
         return
 
-    logger.info(f"Start training for {args.epochs} epochs in sub-dataset{i}")
-    output_dir = Path(os.path.join(args.output_dir, f'sub-dataset{i}'))
+    logger.info(f"Start training for {args.epochs} epochs in sub-dataset{args.start_division}")
+    output_dir = Path(os.path.join(args.output_dir, f'sub-dataset{args.start_division}'))
     os.makedirs(output_dir, exist_ok=True)
 
     # init tensorboard
@@ -502,7 +500,7 @@ def main(args):
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info(f'Training time {total_time_str} on sub-dataset{i}')
+    logger.info(f'Training time {total_time_str} on sub-dataset{args.start_division}')
 
 
 if __name__ == '__main__':

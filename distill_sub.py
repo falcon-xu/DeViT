@@ -25,7 +25,7 @@ from data.get_dataset import build_division_dataset
 
 import models.de_vit
 from models.de_vit import model_config
-
+from core.imp_rank import *
 from utils import dist_utils
 from utils.samplers import RASampler
 from utils.logger import create_logger
@@ -195,6 +195,12 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
+    # shrink
+    parser.add_argument('--load_shrink', action='store_true', default=False)
+    parser.add_argument('--shrink_checkpoint', type=str, default='')
+    parser.add_argument('--neuron_shrinking', action='store_true', default=False)
+    parser.add_argument('--head_shrinking', action='store_true', default=False)
+
     # args = parser.parse_args()
     return parser
 
@@ -238,10 +244,7 @@ def main(args):
     dist_utils.init_distributed_mode(args)
 
     # Create output path
-    if args.model_path != '':
-        args.method = f'distill_sub_qkv_{args.distillation_type}_load'
-    else:
-        args.method = f'distill_sub_qkv_{args.distillation_type}_noload'
+    args.method = f'distill_sub'
     args.name = f'lr{args.lr}-bs{args.batch_size}-epochs{args.epochs}-grad{args.clip_grad}' \
                 f'-wd{args.weight_decay}-wm{args.warmup_epochs}-gama{args.gama[0]}_{args.gama[1]}_{args.gama[2]}'
     args.output_dir = os.path.join(args.output_dir, f'{args.dataset}_div{args.num_division}', f'{args.model}',
@@ -348,7 +351,6 @@ def main(args):
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
-    ##TODO: choose criterion
     # wrap the criterion in our custom DistillationLoss, which
     # just dispatches to the original criterion if args.distillation_type is 'none'
     criterion = DistillLoss(base_criterion=criterion, distillation_type=args.distillation_type,
@@ -363,7 +365,7 @@ def main(args):
             checkpoint = torch.load(args.resume, map_location='cpu')
 
         model_without_ddp.load_state_dict(checkpoint['model'])
-        if not args.eval and not args.prune_finetune and \
+        if not args.eval and not args.finetune and \
                 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -377,6 +379,26 @@ def main(args):
         test_stats = evaluate(data_loader_val, model, args.device)
         logger.info(f"Accuracy of the network on the {len(test_dataset)} test images: {test_stats['acc1']:.1f}%")
         return
+
+    # load shrink
+    if args.shrink_checkpoint != '':
+        shrinked_policy = np.load(os.path.join(args.shrink_checkpoint, 'shrinked_policy.npy'))
+        shrinked_acc = np.load(os.path.join(args.shrink_checkpoint, 'shrinked_accuracy.npy'))
+        max_index = np.argmax(shrinked_acc)
+        neuron_sparsity = shrinked_policy[max_index, :12]
+        head_sparsity = shrinked_policy[max_index, 12:-1]
+
+    if args.neuron_shrinking:
+        logger.info('Start shrink neuron')
+        neuron_mask = mlp_neuron_mask(model_without_ddp, neuron_sparsity,
+                                      mlp_neuron_rank(model_without_ddp, data_loader_train))
+        mlp_neuron_shrink(model_without_ddp, neuron_mask)
+
+    if args.head_shrinking:
+        logger.info('Start shrink head')
+        head_mask = attn_head_mask(model_without_ddp, head_sparsity,
+                                   attn_head_rank(model_without_ddp, data_loader_train))
+        attn_head_shrink(model_without_ddp, head_mask)
 
     logger.info(f"Start training for {args.epochs} epochs in sub-dataset{args.start_division}")
     output_dir = Path(os.path.join(args.output_dir, f'sub-dataset{args.start_division}'))

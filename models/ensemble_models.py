@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from timm.models import create_model
 # import de_vit
-from .de_vit_shrink import *
+from .de_vit import *
 
 
 class MultiViT(nn.Module):

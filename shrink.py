@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+# @Time    : 2023/5/4 17:32
+# @Author  : Falcon
+# @FileName: shrink.py
+
 import os
 import time
 import json
@@ -17,13 +22,12 @@ from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
-import models.de_vit_shrink
+import models.de_vit
 from data.get_dataset import build_division_dataset
 from engine import evaluate
 
-from core.search_imp import search
+from core.shrink_imp import model_shrink
 from core.imp_rank import *
-from core.compute_metric import compute_flops, compute_parameters, cal_prune_paras, cal_prune_macs
 
 from utils import dist_utils
 from utils.logger import create_logger
@@ -145,7 +149,7 @@ def get_args_parser():
     parser.add_argument('--finetune', default='', help='finetune from checkpoint')
 
     # Dataset parameters
-    parser.add_argument('--data-path', default=r'F:\program_lab\python\dataset', type=str,
+    parser.add_argument('--data-path', default=r'./dataset', type=str,
                         help='dataset path')
     parser.add_argument('--data-set', default='cifar100', choices=['cifar100', 'IMNET', 'cars', 'pets', 'flowers'],
                         type=str, help='Image Net dataset path')
@@ -184,14 +188,14 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
     # shrinking related
-    parser.add_argument('--neuron_pruning', action='store_true', default=False)
-    parser.add_argument('--head_pruning', action='store_true', default=False)
+    parser.add_argument('--neuron_shrinking', action='store_true', default=False)
+    parser.add_argument('--head_shrinking', action='store_true', default=False)
     parser.add_argument('--neuron_sparsity', type=float, default=0.)
     parser.add_argument('--head_sparsity', type=float, default=0.)
 
     parser.add_argument('--shrink_ratio', type=float, default=0.3, help='shrinking ratio')
-    parser.add_argument('--search_bound', type=float, default=0.5, help='upper bound')
-    parser.add_argument('--search_population', type=int, default=100)
+    parser.add_argument('--bound', type=float, default=0.5, help='upper bound')
+    parser.add_argument('--population', type=int, default=100)
 
     return parser
 
@@ -201,7 +205,8 @@ def main(args):
 
     # Create output path
     args.method = f'shrink'
-    args.output_dir = os.path.join(args.output_dir, args.method)
+    args.output_dir = os.path.join(args.output_dir, f'{args.dataset}_div{args.num_division}', f'{args.model}',
+                                   args.method)
 
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -221,7 +226,7 @@ def main(args):
     cudnn.benchmark = True
 
     # Load dataset
-    sub_dataset_path = os.path.join(args.data_path, f'sub-dataset{i}')
+    sub_dataset_path = os.path.join(args.data_path, f'sub-dataset{args.start_division}')
     train_dataset, test_dataset, division_num_classes = build_division_dataset(dataset_path=sub_dataset_path, args=args)
     args.num_classes = division_num_classes
 
@@ -388,7 +393,7 @@ def main(args):
             model_without_ddp.load_state_dict(checkpoint)
         else:
             model_without_ddp.load_state_dict(checkpoint['model'])
-            if not args.eval and not args.prune_finetune and \
+            if not args.eval and not args.finetune and \
                     'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -398,19 +403,21 @@ def main(args):
                 if 'scaler' in checkpoint:
                     loss_scaler.load_state_dict(checkpoint['scaler'])
 
-    if args.neuron_pruning:
+    if args.neuron_shrinking:
         neuron_rank = mlp_neuron_rank(model_without_ddp, data_loader_train)
         logger.info(f'Finish ranking neuron.')
-    if args.head_pruning:
+    if args.head_shrinking:
         head_rank = attn_head_rank(model_without_ddp, data_loader_train)
         logger.info(f'Finish ranking head.')
 
-    xp, yp = search(model=model, data_loader_val=data_loader_val, layer=args.classifier_choose,
-                    shrink_ratio=args.shrink_ratio, neuron_rank=neuron_rank,
-                    head_rank=head_rank, device=device, population=args.search_population, lb=0,
-                    ub=args.search_bound, log=logger)
+    xp, yp = model_shrink(model=model, data_loader_val=data_loader_val, layer=args.classifier_choose,
+                          shrink_ratio=args.shrink_ratio, neuron_rank=neuron_rank, head_rank=head_rank, device=device,
+                          population=args.population, lb=0, ub=args.bound, log=logger)
+
     np.save(os.path.join(output_dir, 'shrinked_policy'), xp)
     np.save(os.path.join(output_dir, 'shrinked_accuracy'), yp)
+
+    logger.info(f'Finish shrinking on sub-dataset{args.start_division}')
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)

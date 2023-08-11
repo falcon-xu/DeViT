@@ -62,7 +62,7 @@ def mlp_neuron_mask(model, ratio, rank):
     return neuron_mask
 
 
-def mlp_neuron_prune(model, neuron_mask):
+def mlp_neuron_shrink(model, neuron_mask):
     idx = 0
     for m in model.modules():
         if 'Mlp' in str(m) and 'Attention' not in str(m):
@@ -144,7 +144,7 @@ def attn_head_mask(model, ratio, rank):
     return head_mask
 
 
-def attn_head_prune(model, head_mask):
+def attn_head_shrink(model, head_mask):
     idx = 0
     for m in model.modules():
         if 'Attention' in str(m) and 'Mlp' not in str(m):
@@ -170,59 +170,6 @@ def check_head_sparsity(model):
             ratio.append(torch.sum(m.gate == 0).item() / m.gate.shape[0])
             continue
     return ratio
-
-
-def actual_prune(model, data_loader_train, neuron_sparsity, head_sparsity, log, finetune_path=''):
-    # get rank of mlp neuron and head
-    mlp_rank = mlp_neuron_rank(model, data_loader_train)
-    att_rank = attn_head_rank(model, data_loader_train)
-    # get mask of mlp neuron and head
-    neuron_mask = mlp_neuron_mask(model, neuron_sparsity, mlp_rank)
-    head_mask = attn_head_mask(model, head_sparsity, att_rank)
-
-    # load finetune ckpt
-    if finetune_path != '':
-        model.load_state_dict(torch.load(finetune_path, map_location='cpu'))
-        log.info(f'Load pretrained checkpoint from [PATH]: {finetune_path}')
-
-    # neuron actual prune
-    idx = 0
-    for m in model.modules():
-        if 'Mlp' in str(m) and 'Attention' not in str(m):
-            m.gate = neuron_mask[idx]
-            m.prune(neuron_mask[idx])
-            idx += 1
-
-    # head actual prune
-    idx = 0
-    for m in model.modules():
-        if 'Attention' in str(m) and 'Mlp' not in str(m):
-            m.gate = head_mask[idx]
-            m.prune(head_mask[idx])
-            idx += 1
-
-
-def set_token_selection_layer(model, token_sparsity):
-    idx = 1
-    for m in model.modules():
-        if 'Attention' in str(m) and 'Mlp' not in str(m):
-            if idx in [4, 7, 10]:
-                m.token_prune_ratio = token_sparsity
-            idx += 1
-            continue
-
-
-def reset_token_selection_layer(model, ):
-    idx = 1
-    for m in model.modules():
-        if 'Attention' in str(m) and 'Mlp' not in str(m):
-            if idx in [4, 7, 10]:
-                m.token_prune_ratio = 0
-            idx += 1
-            continue
-    for m in model.modules():
-        if 'Block' in str(m) and 'ModuleList' not in str(m):
-            m.ema_cls_attn = None
 
 
 def center(X):

@@ -1,7 +1,5 @@
-
-
-def cal_prune_paras(neuron_sparsity: list, head_sparsity: list,
-                    emb=768, seq_length=197, mlp_ratio=4, head=12, layer=12, num_class=1000):
+def cal_shrink_paras(neuron_sparsity: list, head_sparsity: list,
+                     emb=768, seq_length=197, mlp_ratio=4, head=12, layer=12, num_class=1000):
     assert len(head_sparsity) == layer, 'The number of layer is not equal to the number of head sparsity.'
 
     paras = 0
@@ -14,10 +12,10 @@ def cal_prune_paras(neuron_sparsity: list, head_sparsity: list,
     ln = 2 * emb
 
     for n_s, h_s in zip(neuron_sparsity, head_sparsity):
-        prune_head = int((1 - h_s) * head)
+        shrink_head = int((1 - h_s) * head)
 
         # Encoder: 1) LN; 2) MHSA; 3) LN; 4) MLP
-        mhsa = prune_head * 3 * emb * head_dim + prune_head * head_dim * emb + emb
+        mhsa = shrink_head * 3 * emb * head_dim + shrink_head * head_dim * emb + emb
         mlp = 2 * emb * int(mlp_ratio * (1 - n_s) * emb) + emb + int(mlp_ratio * (1 - n_s) * emb)
 
         paras += ln + mhsa + ln + mlp
@@ -30,8 +28,8 @@ def cal_prune_paras(neuron_sparsity: list, head_sparsity: list,
     return paras / 1e6
 
 
-def cal_prune_flops(neuron_sparsity: list, head_sparsity: list,
-                    emb=768, seq_length=197, mlp_ratio=4, head=12, layer=12, num_class=1000):
+def cal_shrink_flops(neuron_sparsity: list, head_sparsity: list,
+                     emb=768, seq_length=197, mlp_ratio=4, head=12, layer=12, num_class=1000):
     assert len(head_sparsity) == layer, 'The number of layer is not equal to the number of head sparsity.'
 
     # Neglect softmax and norm
@@ -50,9 +48,9 @@ def cal_prune_flops(neuron_sparsity: list, head_sparsity: list,
              2 * head_dim * seq_length ** 2 + \
              2 * head_dim * seq_length ** 2
 
-        prune_head = int((1 - h_s) * head)
+        shrink_head = int((1 - h_s) * head)
 
-        mhsa = sa * prune_head + seq_length * 2 * head_dim * prune_head * emb
+        mhsa = sa * shrink_head + seq_length * 2 * head_dim * shrink_head * emb
 
         # MLP: 1) Linear 1 ; 2) Linear 2
         mlp = seq_length * int(mlp_ratio * (1 - n_s) * emb) * 2 * emb + \
@@ -66,8 +64,6 @@ def cal_prune_flops(neuron_sparsity: list, head_sparsity: list,
     return flops / 1e9
 
 
-def cal_prune_macs(neuron_sparsity: list, head_sparsity: list,
+def cal_shrink_macs(neuron_sparsity: list, head_sparsity: list,
                     emb=768, seq_length=197, mlp_ratio=4, head=12, layer=12, num_class=1000):
-    return cal_prune_flops(neuron_sparsity,head_sparsity,emb,seq_length,mlp_ratio,head,layer,num_class) / 2
-
-
+    return cal_shrink_flops(neuron_sparsity, head_sparsity, emb, seq_length, mlp_ratio, head, layer, num_class) / 2

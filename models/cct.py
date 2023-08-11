@@ -249,32 +249,6 @@ def cct_14(arch=None, pretrained=False, progress=True, *args, **kwargs):
 
 
 
-def get_cct14(pretrained_path=None, num_classes=1000, progress=False, kernel_size=3, n_conv_layers=2,
-              img_size=32, positional_embedding='learnable', *args, **kwargs):
-    model = cct_14(pretrained=False, progress=progress,
-                   kernel_size=kernel_size, n_conv_layers=n_conv_layers,
-                   img_size=img_size, positional_embedding=positional_embedding,
-                   num_classes=num_classes,
-                   *args, **kwargs)
-    if pretrained_path is not None:
-        model.load_state_dict(torch.load(pretrained_path))
-
-    return model
-
-
-def get_decct(pretrained_path=None, num_classes=1000, progress=False, kernel_size=3, n_conv_layers=2,
-             img_size=32, positional_embedding='learnable', backbone=False, *args, **kwargs):
-    model = cct_7(pretrained=False, progress=progress,
-                  kernel_size=kernel_size, n_conv_layers=n_conv_layers,
-                  img_size=img_size, positional_embedding=positional_embedding,
-                  num_classes=num_classes, backbone=backbone,
-                  *args, **kwargs)
-    if pretrained_path is not None:
-        model.load_state_dict(torch.load(pretrained_path))
-
-    return model
-
-
 @register_model
 def cct_2_3x2_32(pretrained=False, progress=False,
                  img_size=32, positional_embedding='learnable', num_classes=10,
@@ -482,3 +456,16 @@ def cct_14_7x2_384_fl(pretrained=False, progress=False,
                   img_size=img_size, positional_embedding=positional_embedding,
                   num_classes=num_classes,
                   *args, **kwargs)
+
+
+def get_decct(pretrained_path=None, num_classes=1000, progress=False, kernel_size=3, n_conv_layers=2,
+             img_size=32, positional_embedding='learnable', backbone=False, *args, **kwargs):
+    model = cct_7(pretrained=False, progress=progress,
+                  kernel_size=kernel_size, n_conv_layers=n_conv_layers,
+                  img_size=img_size, positional_embedding=positional_embedding,
+                  num_classes=num_classes, backbone=backbone,
+                  *args, **kwargs)
+    if pretrained_path is not None:
+        model.load_state_dict(torch.load(pretrained_path))
+
+    return model

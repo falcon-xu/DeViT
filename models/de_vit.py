@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2023/3/20 9:50
+# @Time    : 2023/5/4 19:43
 # @Author  : Falcon
 # @FileName: de_vit.py
 
@@ -13,9 +13,38 @@ import torch.nn.functional as F
 from functools import partial
 from .utils.config import model_config
 from timm.models.vision_transformer import _cfg
-from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
+from timm.models.layers import PatchEmbed, DropPath, trunc_normal_, lecun_normal_
 from timm.models.helpers import named_apply, adapt_input_conv
 from timm.models.registry import register_model
+
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.hidden_features = hidden_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+        ### FFN neuron shrinking
+        self.gate = torch.ones(hidden_features)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+
+        ### FFN neuron shrinking
+        self.neuron_output = x  # B x N x C
+        mask = self.gate.float().to(x.get_device())
+        x.mul_(mask.view(1, 1, self.hidden_features))
+
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
 
 
 class Attention(nn.Module):
@@ -30,6 +59,9 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        ### MSA head shrinking
+        self.gate = torch.ones(self.num_heads)
+
     def forward(self, x, output_qkv=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -39,7 +71,14 @@ class Attention(nn.Module):
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = (attn @ v).transpose(1, 2)
+
+        # MSA head shrinking
+        self.head_output = x  # batch x seq x head x embed_chunk
+        mask = self.gate.float().to(x.get_device())
+        x.mul_(mask.view(1, 1, self.num_heads, 1))
+
+        x = x.reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -213,6 +252,9 @@ class VisionTransformer(nn.Module):
         Returns: tokens, qkv_outputs, attention_outputs, encoder_outputs {dict}
 
         '''
+
+        # TODO: add emb shrinking
+
         x = self.patch_embed(x)
         cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
         if self.dist_token is None:
@@ -254,11 +296,11 @@ class VisionTransformer(nn.Module):
         '''
 
         Args:
-            output_cls (): 
-            output_qkv (): 
-            output_att (): 
-            output_emb (): 
-            output_encoders (): 
+            output_cls ():
+            output_qkv ():
+            output_att ():
+            output_emb ():
+            output_encoders ():
 
         Returns:
 
@@ -270,7 +312,7 @@ class VisionTransformer(nn.Module):
         last_tokens = x
         if self.resize_dim is not None:
             last_tokens = self.resize_mlp(last_tokens)
-        
+
         if self.head_dist is not None:
             x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
             outputs['output'] = (x, x_dist) if self.training else (x + x_dist) / 2
@@ -448,77 +490,6 @@ def checkpoint_filter_fn(state_dict, model):
                 v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
         out_dict[k] = v
     return out_dict
-
-
-@register_model
-def deit_base_patch16_224(pretrained=False, pretrained_path=None, **kwargs):
-    model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-                              norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained_path is not None and pretrained:
-        model.load_state_dict(torch.load(pretrained_path)['model'])
-    return model
-
-
-@register_model
-def deit_tiny_patch16_224(pretrained=False, pretrained_path=None, **kwargs):
-    model = VisionTransformer(patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
-                              norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained_path is not None and pretrained:
-        model.load_state_dict(torch.load(pretrained_path)['model'])
-    return model
-
-
-@register_model
-def deit_base_distilled_patch16_224(pretrained=False, pretrained_path=None, **kwargs):
-    model = VisionTransformer(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), distilled=True, **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained_path is not None and pretrained:
-        model.load_state_dict(torch.load(pretrained_path)['model'])
-    return model
-
-@register_model
-def deit_tiny_distilled_patch16_224(pretrained=False, pretrained_path=None, **kwargs):
-    model = VisionTransformer(
-        patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), distilled=True, **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained_path is not None and pretrained:
-        model.load_state_dict(torch.load(pretrained_path)['model'])
-    return model
-
-
-@register_model
-def vit_large_patch16_224(pretrained=False, pretrained_path=None, **kwargs):
-    model = VisionTransformer(patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
-                              norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained_path is not None and pretrained:
-        model.load_pretrained(checkpoint_path=pretrained_path)
-    return model
-
-
-@register_model
-def vit_base_patch16_224(pretrained=False, pretrained_path=None, **kwargs):
-    model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-                              norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained_path is not None and pretrained:
-        model.load_pretrained(checkpoint_path=pretrained_path)
-    return model
-
-
-@register_model
-def vit_tiny_patch16_224(pretrained=False, pretrained_path=None, **kwargs):
-    model = VisionTransformer(patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
-                              norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained_path is not None and pretrained:
-        model.load_pretrained(checkpoint_path=pretrained_path)
-    return model
 
 
 @register_model
