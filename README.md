@@ -18,6 +18,8 @@ pytorch==1.8.1
 torchvision==0.9.1
 tqdm==4.65.0
 timm==0.5.4
+scikit-optimize==0.9.0
+scikit_learn==1.0.2
 ```
 
 
@@ -57,3 +59,5 @@ timm==0.5.4
   python -m torch.distributed.launch --nproc_per_node=8 --master_addr=127.0.0.2 --master_port=29502 --use_env ensemble.py --batch-size 128 --eval-batch-size 256 --epochs 50 --model dedeit --model-path ./model_path --model-ema --lr 3e-4 --data-path ./datasets --dataset cifar100 --num_division 4 --output_dir ./output --teacher-model deit_base_distilled_patch16_224 --teacher-path ./teacher_ckpt.pth --sub_classes 25 25 25 25
   ```
 
+## Acknowledgement 
+This repository is built using the [timm](https://github.com/rwightman/pytorch-image-models) library, [DeiT](https://github.com/facebookresearch/deit), [Compact Transformers](https://github.com/SHI-Labs/Compact-Transformers) repositories.

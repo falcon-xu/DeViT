@@ -25,7 +25,7 @@ import models.de_vit
 from models.de_vit import model_config
 from data.get_dataset import build_dataset
 from utils.samplers import RASampler
-from models.ensemble_models import MultiModels, MultiViT, EnsMLP
+from models.ensemble_models import MultiViT, EnsMLP
 from engine import train_1epoch_ens_disjoint, evaluate_ens_disjoint
 
 from utils import dist_utils
@@ -35,7 +35,7 @@ from utils.losses import EnsLoss
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
+    parser = argparse.ArgumentParser('DeViT Ensemble training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=2, type=int)
     parser.add_argument('--eval-batch-size', default=10, type=int)
     parser.add_argument('--epochs', default=3, type=int)

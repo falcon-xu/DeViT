@@ -34,7 +34,7 @@ from utils.dist_utils import get_rank, get_world_size, init_distributed_mode
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('ViT training and evaluation script', add_help=False)
+    parser = argparse.ArgumentParser('DeViT training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=2, type=int)
     parser.add_argument('--eval-batch-size', default=512, type=int)
     parser.add_argument('--epochs', default=5, type=int)
