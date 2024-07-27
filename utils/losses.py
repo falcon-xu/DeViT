@@ -34,18 +34,89 @@ class LabelSmoothingCrossEntropy(nn.Module):
         return self._compute_losses(x, target).mean()
 
 
-class SoftCrossEntropy(nn.Module):
-    def __init__(self):
-        super(SoftCrossEntropy, self).__init__()
+def soft_cross_entropy(predicts, targets):
+    student_likelihood = torch.nn.functional.log_softmax(predicts, dim=-1)
+    targets_prob = torch.nn.functional.softmax(targets, dim=-1)
+    loss_batch = torch.sum(- targets_prob * student_likelihood, dim=-1)
+    return loss_batch.mean()
 
-    def _compute_losses(self, predicts, targets):
-        student_likelihood = torch.nn.functional.log_softmax(predicts, dim=-1)
-        targets_prob = torch.nn.functional.softmax(targets, dim=-1)
-        loss = (- targets_prob * student_likelihood).mean()
-        return loss
 
-    def forward(self, predicts, targets):
-        return self._compute_losses(predicts, targets)
+class DistillationLoss(torch.nn.Module):
+    """
+    Refer from https://github.com/facebookresearch/deit/blob/main/losses.py
+    vit timm version
+    This module wraps a standard criterion and adds an extra knowledge distillation loss by
+    taking a teacher model prediction and using it as additional supervision.
+    """
+
+    def __init__(self, base_criterion: torch.nn.Module, teacher_model: torch.nn.Module,
+                 distillation_type: str, alpha: float, tau: float, distill_token: bool):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.token_criterion = torch.nn.MSELoss()
+        self.teacher_model = teacher_model
+        assert distillation_type in ['none', 'soft', 'hard']
+        self.distillation_type = distillation_type
+        self.distill_token = distill_token
+        self.alpha = alpha
+        self.tau = tau
+
+    def _compute_cls_distill_loss(self, outputs_kd, teacher_outputs):
+        if self.distillation_type == 'soft':
+            T = self.tau
+            # taken from https://github.com/peterliht/knowledge-distillation-pytorch/blob/master/model/net.py#L100
+            # with slight modifications
+            distillation_loss = F.kl_div(
+                F.log_softmax(outputs_kd / T, dim=1),
+                # We provide the teacher's targets in log probability because we use log_target=True
+                # (as recommended in pytorch https://github.com/pytorch/pytorch/blob/9324181d0ac7b4f7949a574dbc3e8be30abe7041/torch/nn/functional.py#L2719)
+                # but it is possible to give just the probabilities and set log_target=False. In our experiments we tried both.
+                F.log_softmax(teacher_outputs / T, dim=1),
+                reduction='sum',
+                log_target=True
+            ) * (T * T) / outputs_kd.numel()
+            # We divide by outputs_kd.numel() to have the legacy PyTorch behavior.
+            # But we also experiments output_kd.size(0)
+            # see issue 61(https://github.com/facebookresearch/deit/issues/61) for more details
+        elif self.distillation_type == 'hard':
+            distillation_loss = F.cross_entropy(outputs_kd, teacher_outputs.argmax(dim=1))
+        return distillation_loss
+
+    def forward(self, inputs, outputs, labels, token_outputs=None):
+        """
+        Args:
+            inputs: The original inputs that are feed to the teacher model
+            outputs: the outputs of the model to be trained. It is expected to be
+                either a Tensor, with the original output
+                in the first position and the distillation predictions as the second output
+            labels: the labels for the base criterion
+        """
+        outputs_kd = None
+        if not isinstance(outputs, torch.Tensor):
+            # assume that the model outputs a tuple of [outputs, outputs_kd]
+            outputs, outputs_kd = outputs
+
+        base_loss = self.base_criterion(outputs, labels)
+        if self.distillation_type == 'none':
+            return base_loss
+
+        teacher_token = None
+        # don't backprop throught the teacher
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model(inputs, self.distill_token)
+        if not isinstance(teacher_outputs, torch.Tensor):
+            teacher_token, teacher_outputs = teacher_outputs
+            if token_outputs is None:
+                raise ValueError("When distill token is enabled, the model is expected to gain a token input")
+            token_loss = self.token_criterion(token_outputs, teacher_token)
+
+        distillation_loss = self._compute_cls_distill_loss(outputs_kd, teacher_outputs)
+
+        cls_loss = base_loss * (1 - self.alpha) + distillation_loss * self.alpha
+        if self.distill_token:
+            return cls_loss, token_loss
+        else:
+            return cls_loss
 
 
 class DistillLoss(nn.Module):
@@ -231,3 +302,27 @@ def cal_hid_relation_loss(stu_hid_list, tea_hid_list):
         tea_rela = tea_hid @ tea_hid.transpose(-1, -2)
         loss += torch.mean((stu_rela - tea_rela)**2)
     return loss / layer_num
+
+
+def feature_relation_loss(teacher_feature: torch.Tensor, student_feature: torch.Tensor):
+
+    criterion = nn.KLDivLoss(reduction="batchmean", log_target=True)
+    bs, num_head, num_token, teacher_head_size = teacher_feature.shape
+    student_head_size = student_feature.shape[-1]
+
+    teacher_heads_feature = teacher_feature.unbind(dim=1)
+    teacher_feature = torch.stack(teacher_heads_feature, dim=2).reshape(bs, num_token, -1) # concate by head
+    student_heads_feature = student_feature.unbind(dim=1)
+    student_feature = torch.stack(student_heads_feature, dim=2).reshape(bs, num_token, -1) # concate by head
+
+    teacher_feature_relation = torch.matmul(teacher_feature, teacher_feature.transpose(-1,-2))
+    teacher_feature_relation = teacher_feature_relation / math.sqrt(teacher_head_size)
+    teacher_feature_relation_log = F.log_softmax(teacher_feature_relation, dim=-1)
+
+    studnet_feature_relation = torch.matmul(student_feature, student_feature.transpose(-1, -2))
+    studnet_feature_relation = studnet_feature_relation / math.sqrt(student_head_size)
+    studnet_feature_relation_log = F.log_softmax(studnet_feature_relation, dim=-1)
+
+    loss = criterion(studnet_feature_relation_log, teacher_feature_relation_log)
+
+    return loss

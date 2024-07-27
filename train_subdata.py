@@ -384,7 +384,7 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=division_num_classes)
 
     logger.info(f"Creating model: {args.model}")
-    model, teacher_model = get_models(args=args, num_classes=division_num_classes, num_sub=i, log=logger)
+    model, teacher_model = get_models(args=args, num_classes=division_num_classes, num_sub=args.start_division, log=logger)
 
     model_ema = None
     if args.model_ema:
